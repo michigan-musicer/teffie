@@ -7,6 +7,7 @@ import queue
 import threading
 import numpy as np
 import sounddevice as sd
+import asyncio
 
 DEBUG = True
 DEBUG_FILE_NAME = "log.txt"
@@ -38,7 +39,7 @@ class Teffie:
     sd.default.samplerate = 16000
     _FRAMES_PER_SECOND = 16000
     # fiddle with this to change chunk size
-    _SECONDS_PER_CHUNK = 5
+    _SECONDS_PER_CHUNK = 0.5
     FRAMES_PER_CHUNK = _FRAMES_PER_SECOND * _SECONDS_PER_CHUNK
     # forcing 1 channel minimizes data size, which will be helpful for speed
     sd.default.channels = 1
@@ -82,13 +83,8 @@ class Teffie:
             if not os.path.exists(root_path):
                 print(f"{colors.WARNING}directory {root_path} does not exist. Creating {root_path}...{colors.ENDC}")
                 os.mkdir(f'./{root_path}')
-            # Queue is impl'd by ring buffer.
-            self._handle_ring_buffer = [self.HandleWrapper( \
-                open(f'{root_path}/input_slice_{index}', 'w'), f'{root_path}/input_slice_{index}' \
-            ) for index in range(self._num_handles)]
-            self._ring_start = -1 # begins as invalid
-            self._ring_end = 0
-            self._size = 0
+            # File handles are enqueued onto an async-friendly queue.
+            self._queue = queue.Queue() 
         
         def size(self):
             return self._size
@@ -104,7 +100,7 @@ class Teffie:
             debug_print(f"{colors.WARNING}Popping from HandleQueue{colors.ENDC}")
             debug_print(f"{colors.WARNING}About to begin waiting for item in HandleQueue pop{colors.ENDC}")
             while not self.has_item():
-                print_debug(f"{colors.FAIL}Busy waiting in record_audio outside of callback{colors.ENDC}")
+                debug_print(f"{colors.FAIL}Busy waiting in get call in HandleQueue{colors.ENDC}")
                 pass    
             debug_print(f"{colors.WARNING}HandleQueue pop not waiting, HandleQueue size is {self.size()}{colors.ENDC}")
             return_buffer = np.fromfile(self._handle_ring_buffer[self._ring_start].get_filename())
@@ -131,6 +127,11 @@ class Teffie:
         debug_print(f"{colors.WARNING}NUMPY_DTYPE is {self.NUMPY_DTYPE}{colors.ENDC}")
         debug_print(f"{colors.WARNING}NUM_HANDLES is {self.NUM_HANDLES}{colors.ENDC}")
         
+        # TODO: convert this to two queues: we fill disk in record_audio, then fill an async queue 
+        # or we change the setup of handleQueue so that we have one queue of available handles and one queue of actual
+        # information that is exposed to consumers
+        # basically, producer => files, consumer <= async queue (what a weird setup....)
+        # or just use event.wait here as well lol
         self._input_reader_to_speech_transcriber_queue = self.HandleQueue(self.NUM_HANDLES, "audio_slices")
         # we may need to use the handle queue for these other two queues? depends how much accumulation we have
         self._speech_transcriber_to_text_generator_queue = queue.Queue()
@@ -144,7 +145,6 @@ class Teffie:
         self._speech_generator = None 
 
     def record_audio(self):
-        buffer = np.empty((self.FRAMES_PER_CHUNK, self.NUM_INPUT_CHANNELS), dtype=self.NUMPY_DTYPE)
         def refresh_buffer():
             nonlocal buffer
             buffer = np.empty((self.FRAMES_PER_CHUNK, self.NUM_INPUT_CHANNELS), dtype=self.NUMPY_DTYPE)
@@ -156,6 +156,7 @@ class Teffie:
             debug_print(f"{colors.FAIL}using placeholder silence detection to always enqueue buffers for transcription{colors.ENDC}")
             return True, buffer.size, buffer.size # uncomment this to always enqueue blocks for transcription
 
+        buffer = np.empty((self.FRAMES_PER_CHUNK, self.NUM_INPUT_CHANNELS), dtype=self.NUMPY_DTYPE)
         idx = 0
         current_block_is_done = False
         buffer_locked_by_main = False
@@ -197,9 +198,8 @@ class Teffie:
                 debug_print(f"{colors.FAIL}Busy waiting in record_audio outside of callback{colors.ENDC}")
                 # TODO: stop busy waiting! Use a mutex or find bindings to C functions that do what you want!
                 if current_block_is_done:
-                    # we need to lock buffer so that callback isn't called and overwrites the buffer
-                    # since there's only two concurrent thingies using buffer, we can do a simple boolean lock i think
-                    # I would prefer a solution that tells callback to pause until done
+                # I would prefer a solution that tells fn not to go to callback until done, but I don't know if this is possible
+                # in the sounddevice library
                     buffer_locked_by_main = True
                     debug_print(f"{colors.WARNING}buffer_locked_by_main set to True, placing into processed_audio_queue{colors.ENDC}")
                     processed_audio_queue.put(buffer)
@@ -207,13 +207,12 @@ class Teffie:
                     refresh_buffer()
                     debug_print(f"{colors.WARNING}buffer refreshed, about to release lock{colors.ENDC}")
                     buffer_locked_by_main = False
-                    current_block_is_done = False
+                    current_block_is_done.clear()
                     debug_print(f"{colors.WARNING}buffer_locked_by_main set to False, allowing callback to resume{colors.ENDC}")
 
                     next_buffer = processed_audio_queue.get()
                     debug_print(f"{colors.WARNING}acquired next buffer to process from {colors.ENDC}")
                     has_silence, silence_start_index, silence_end_index = detect_silence(next_buffer)
-                    # check dimension here
                     if has_silence and cumulative_buffer.size > 0:
                         # append up to silence, push to queue, and then restart cumulative buffer from end of silence.
                         cumulative_buffer = np.append(cumulative_buffer, next_buffer[:silence_start_index], axis=0)
