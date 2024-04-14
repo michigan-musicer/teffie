@@ -1,4 +1,6 @@
-from transformers import pipeline
+import whisper
+# from transformers import pipeline
+import torch
 
 import os
 import queue 
@@ -7,9 +9,12 @@ import numpy as np
 import sounddevice as sd
 
 DEBUG = True
+DEBUG_FILE_NAME = "log.txt"
+DEBUG_FILE = None
 def debug_print(string):
     if DEBUG:
         print(string)
+        DEBUG_FILE.write(f"{string}\n")
 
 # taken directly from blender according to https://stackoverflow.com/questions/287871/how-do-i-print-colored-text-to-the-terminal
 # I'm gonna switch some of these around later
@@ -28,29 +33,47 @@ class Teffie:
     # sample rate can be thought of as frames per second, so using this value
     # by itself is basically saying "each chunk is 1 second" 
     # We convert to int to avoid type errors when creating numpy arrays
-    FRAMES_PER_CHUNK = int(sd.query_devices(sd.default.device)["default_samplerate"])
-    NUM_CHANNELS = int(sd.query_devices(sd.default.device)["max_input_channels"]) 
+    # _FRAMES_PER_SECOND = int(sd.query_devices(sd.default.device)["default_samplerate"])
+    # 16000 is the sample rate for whisper and must be followed by low-level code
+    sd.default.samplerate = 16000
+    _FRAMES_PER_SECOND = 16000
+    # fiddle with this to change chunk size
+    _SECONDS_PER_CHUNK = 5
+    FRAMES_PER_CHUNK = _FRAMES_PER_SECOND * _SECONDS_PER_CHUNK
+    # forcing 1 channel minimizes data size, which will be helpful for speed
+    sd.default.channels = 1
+    # sd.default.channels is a tuple, so just grab the first and second each
+    NUM_INPUT_CHANNELS = sd.default.channels[0]
+    NUM_OUTPUT_CHANNELS = sd.default.channels[1]
+    # NUM_INPUT_CHANNELS = int(sd.query_devices(sd.default.device)["max_input_channels"]) 
     NUMPY_DTYPE = np.float32
-    NUM_HANDLES = 16
+    NUM_HANDLES = 1024
 
     class HandleQueue:
         class HandleWrapper:
-            def __init__(self, handle):
+            def __init__(self, handle, filename):
                 # print("running ctor")
-                self.handle = handle
+                self._handle = handle
+                self._filename = filename
 
             def __del__(self):
                 # print("running dtor")
-                self.handle.truncate(0)
+                self._handle.truncate(0)
                 # print("finished dtor")
+
+            def get_handle(self):
+                return self._handle
             
+            def get_filename(self):
+                return self._filename
+
             # requires content to be ndarray type.
             def write(self, content):
-                content.tofile(self.handle)
-                # self.handle.write(content) # this is the naive way
+                content.tofile(self._handle)
+                # self._handle.write(content) # this is the naive way
         
             def clear(self):
-                self.handle.truncate(0)
+                self._handle.truncate(0)
 
         # root_path is the directory which will contain all the files controlled by HandleQueue.
         def __init__(self, num_handles, root_path):
@@ -60,12 +83,12 @@ class Teffie:
                 print(f"{colors.WARNING}directory {root_path} does not exist. Creating {root_path}...{colors.ENDC}")
                 os.mkdir(f'./{root_path}')
             # Queue is impl'd by ring buffer.
-            self._handle_ring_buffer = [self.HandleWrapper(open(f'input_slice_{index}', 'w')) for index in range(self._num_handles)]
+            self._handle_ring_buffer = [self.HandleWrapper( \
+                open(f'{root_path}/input_slice_{index}', 'w'), f'{root_path}/input_slice_{index}' \
+            ) for index in range(self._num_handles)]
             self._ring_start = -1 # begins as invalid
             self._ring_end = 0
             self._size = 0
-
-            self._cv = threading.Condition()
         
         def size(self):
             return self._size
@@ -79,41 +102,32 @@ class Teffie:
         # fetches and returns data from first written-to file 
         def get(self):
             debug_print(f"{colors.WARNING}Popping from HandleQueue{colors.ENDC}")
-            self._cv.acquire()
-            debug_print(f"{colors.WARNING}Condition lock acquired by HandleQueue.get call{colors.ENDC}")
+            debug_print(f"{colors.WARNING}About to begin waiting for item in HandleQueue pop{colors.ENDC}")
             while not self.has_item():
-                debug_print(f"{colors.WARNING}HandleQueue empty, waiting for item{colors.ENDC}")
-                self._cv.wait()
-            debug_print(f"{colors.WARNING}HandleQueue pop no longer waiting, HandleQueue size is {self.size()}{colors.ENDC}")
-            return_buffer = np.fromfile(self._handle_ring_buffer[self._ring_start])
+                print_debug(f"{colors.FAIL}Busy waiting in record_audio outside of callback{colors.ENDC}")
+                pass    
+            debug_print(f"{colors.WARNING}HandleQueue pop not waiting, HandleQueue size is {self.size()}{colors.ENDC}")
+            return_buffer = np.fromfile(self._handle_ring_buffer[self._ring_start].get_filename())
             self._handle_ring_buffer[self._ring_start].clear()
             self._ring_start = (self._ring_start + 1) % self._num_handles
             self._size -= 1 
             debug_print(f"{colors.WARNING}item popped from queue in HandleQueue.get call{colors.ENDC}")
-            self._cv.release()
-            debug_print(f"{colors.WARNING}Condition lock released by HandleQueue.get call{colors.ENDC}")
             return return_buffer
 
         # writes to end position
         def put(self, data):
             debug_print(f"{colors.WARNING}Putting onto HandleQueue{colors.ENDC}")
-            self._cv.acquire()
-            debug_print(f"{colors.WARNING}Condition lock acquired by HandleQueue.put call{colors.ENDC}")
             if self._size == self._num_handles:
                 raise Exception(f"{colors.ERROR}attempted to write to full HandleQueue object{colors.ENDC}")
             self._handle_ring_buffer[self._ring_end].write(data)
             self._ring_end = (self._ring_end + 1) % self._num_handles
             self._size += 1
             debug_print(f"{colors.WARNING}item added to queue in HandleQueue.put call{colors.ENDC}")
-            self._cv.notify()
-            debug_print(f"{colors.WARNING}Notify sent from HandleQueue.put call{colors.ENDC}")
-            self._cv.release()
-            debug_print(f"{colors.WARNING}Condition lock released by HandleQueue.put call{colors.ENDC}")
-
 
     def __init__(self):
         debug_print(f"{colors.WARNING}FRAMES_PER_CHUNK is {self.FRAMES_PER_CHUNK}{colors.ENDC}")
-        debug_print(f"{colors.WARNING}NUM_CHANNELS is {self.NUM_CHANNELS}{colors.ENDC}")
+        debug_print(f"{colors.WARNING}NUM_INPUT_CHANNELS is {self.NUM_INPUT_CHANNELS}{colors.ENDC}")
+        debug_print(f"{colors.WARNING}NUM_OUTPUT_CHANNELS is {self.NUM_OUTPUT_CHANNELS}{colors.ENDC}")
         debug_print(f"{colors.WARNING}NUMPY_DTYPE is {self.NUMPY_DTYPE}{colors.ENDC}")
         debug_print(f"{colors.WARNING}NUM_HANDLES is {self.NUM_HANDLES}{colors.ENDC}")
         
@@ -122,17 +136,18 @@ class Teffie:
         self._speech_transcriber_to_text_generator_queue = queue.Queue()
         self._text_generator_to_speech_generator_queue = queue.Queue()
 
-        print(f"{colors.OKCYAN}Loading audio transcription pipeline...{colors.ENDC}")
-        self._speech_transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-tiny")
-        print(f"{colors.OKCYAN}Done loading audio transcription pipeline{colors.ENDC}")
+        print(f"{colors.OKCYAN}Loading audio transcription model...{colors.ENDC}")
+        # self._speech_transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-tiny")
+        self._speech_transcriber = whisper.load_model("tiny.en")
+        print(f"{colors.OKCYAN}Done loading audio transcription model{colors.ENDC}")
         self._text_generator = None
         self._speech_generator = None 
 
     def record_audio(self):
-        buffer = np.empty((self.FRAMES_PER_CHUNK, self.NUM_CHANNELS), dtype=self.NUMPY_DTYPE)
+        buffer = np.empty((self.FRAMES_PER_CHUNK, self.NUM_INPUT_CHANNELS), dtype=self.NUMPY_DTYPE)
         def refresh_buffer():
             nonlocal buffer
-            buffer = np.empty((self.FRAMES_PER_CHUNK, self.NUM_CHANNELS), dtype=self.NUMPY_DTYPE)
+            buffer = np.empty((self.FRAMES_PER_CHUNK, self.NUM_INPUT_CHANNELS), dtype=self.NUMPY_DTYPE)
             
         def detect_silence(buffer):
             debug_print(f"{colors.WARNING}beginning silence detection{colors.ENDC}")
@@ -151,6 +166,7 @@ class Teffie:
             nonlocal current_block_is_done
             nonlocal buffer_locked_by_main
             
+            debug_print(f"{colors.FAIL}in callback{colors.ENDC}")
             if status:
                 print(status)
             if buffer_locked_by_main:
@@ -174,10 +190,12 @@ class Teffie:
 
         input_stream = sd.InputStream(callback=callback, latency='low', dtype=self.NUMPY_DTYPE)
         with input_stream:
-            cumulative_buffer = np.empty((0, self.NUM_CHANNELS), dtype=self.NUMPY_DTYPE)
+            cumulative_buffer = np.empty((0, self.NUM_INPUT_CHANNELS), dtype=self.NUMPY_DTYPE)
             # what's the simplest queue we can use for this? we really just need a FIFO data structure
             processed_audio_queue = queue.SimpleQueue()
             while True:
+                debug_print(f"{colors.FAIL}Busy waiting in record_audio outside of callback{colors.ENDC}")
+                # TODO: stop busy waiting! Use a mutex or find bindings to C functions that do what you want!
                 if current_block_is_done:
                     # we need to lock buffer so that callback isn't called and overwrites the buffer
                     # since there's only two concurrent thingies using buffer, we can do a simple boolean lock i think
@@ -201,26 +219,49 @@ class Teffie:
                         cumulative_buffer = np.append(cumulative_buffer, next_buffer[:silence_start_index], axis=0)
                         self._input_reader_to_speech_transcriber_queue.put(cumulative_buffer)
                         cumulative_buffer = next_buffer[silence_end_index:]
+                        debug_print(f"{colors.WARNING}buffer pushed to queue. Current number of file handles in use: {self._input_reader_to_speech_transcriber_queue.size()}{colors.ENDC}")
                     else:
                         # add all of the last buffer to cumulative buffer.
                         cumulative_buffer = np.append(cumulative_buffer, next_buffer, axis=0)
+                    if self._input_reader_to_speech_transcriber_queue.size() > 16:
+                        debug_print(f"{colors.FAIL}stopping early for profiling convenience{colors.ENDC}")
+                        return
                     
 
                     
-                
 
     def transcribe_audio(self):
+        # applies all transformations to np array necessary to pass into whisper model 
+        # referencing https://github.com/openai/whisper/discussions/450
+        # my guess is for silence detection, we may repeat some work
+        def transform_buffer(buffer):
+            x = torch.from_numpy(buffer.flatten() / 32768.0).float()
+            print(x.shape)
+            print(whisper.pad_or_trim(x).shape)
+            return whisper.pad_or_trim(torch.from_numpy(buffer.flatten() / 32768.0).float())
+
+        decoding_options = whisper.DecodingOptions(language="en")
         while True:
             next_input = self._input_reader_to_speech_transcriber_queue.get()
-            print(next_input)
+            # print(next_input)
+            if next_input.size == 0:
+                debug_print(f"{colors.WARNING}input size is 0, skipping transcription{colors.ENDC}")
+                continue
             print("Starting transcription...")
             # NOTE: replacement starts here
             # we may need to use lower level functions here. transcribe uses a 30 second window
             # which is way longer than the input we are passing in anyway
-            transcription = self._speech_transcriber.transcribe(next_input)
+            # transcription = self._speech_transcriber(next_input)
+            # next_input = torch.from_numpy(next_input).float()
+            # next_input = whisper.pad_or_trim(next_input)
+            next_input = transform_buffer(next_input)
+            mel = whisper.log_mel_spectrogram(next_input).to(self._speech_transcriber.device)
+            transcription = whisper.decode(self._speech_transcriber, mel, decoding_options)
+            print(transcription)
+            # transcription = self._speech_transcriber.transcribe(next_input)
             print("Finished transcription")
-            self._speech_transcriber_to_text_generator_queue.put(transcription)
-            print(self._speech_transcriber_to_text_generator_queue.qsize())
+            # self._speech_transcriber_to_text_generator_queue.put(transcription)
+            # print(self._speech_transcriber_to_text_generator_queue.qsize())
 
     def generate_text(self):
         pass
@@ -237,9 +278,12 @@ class Teffie:
 if __name__ == "__main__":
     try:
         print(f"{colors.HEADER}Running teffie...{colors.ENDC}")
+        DEBUG_FILE = open(DEBUG_FILE_NAME, "w", buffering=1) # buffering=1 flushes after each line
         t = Teffie()
         t.run()
         # cProfile.run('t.run()')
     except KeyboardInterrupt:
-        print(f"\n{colors.HEADER}Terminated{colors.ENDC}")
+        print(f"\n{colors.HEADER}Termination begun{colors.ENDC}")
+        DEBUG_FILE.close()
+        print(f"\n{colors.HEADER}Termination finished{colors.ENDC}")
 
