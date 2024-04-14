@@ -1,7 +1,5 @@
 import whisper
 
-import whisper
-
-model = whisper.load_model("base")
+model = whisper.load_model("tiny.en")
 result = model.transcribe("audio.mp3")
 print(result["text"])
