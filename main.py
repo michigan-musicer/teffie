@@ -3,10 +3,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, VitsModel, AutoTok
 from transformers.utils import logging
 import torch
 
-import os
 import numpy as np
 import sounddevice as sd
 import threading
+import keyboard
 
 import time
 
@@ -39,8 +39,8 @@ class Teffie:
     sd.default.samplerate = 16000
     _FRAMES_PER_SECOND = 16000
     # fiddle with this to change chunk size
-    _SECONDS_PER_CHUNK = 5
-    FRAMES_PER_CHUNK = _FRAMES_PER_SECOND * _SECONDS_PER_CHUNK
+    _SECONDS_PER_CHUNK = 0.1
+    FRAMES_PER_CHUNK = int(_FRAMES_PER_SECOND * _SECONDS_PER_CHUNK)
     # forcing 1 channel minimizes data size, which will be helpful for speed
     sd.default.channels = 1
     # sd.default.channels is a tuple, so just grab the first and second each
@@ -60,6 +60,8 @@ class Teffie:
         self._speech_transcriber = whisper.load_model("base.en")
         print(f"{colors.OKCYAN}Done loading audio transcription model{colors.ENDC}")
         
+        # NOTE: these load from the internet, which is not ideal with our school's crappy wifi
+        # preferably to load from cache
         print(f"{colors.OKCYAN}Loading text generation model...{colors.ENDC}")
         self._text_generator = AutoModelForCausalLM.from_pretrained("microsoft/phi-1_5", torch_dtype="auto")
         print(f"{colors.OKCYAN}Done loading text generation model{colors.ENDC}")
@@ -70,13 +72,32 @@ class Teffie:
         self._speech_tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-eng")
         print(f"{colors.OKCYAN}Done loading speech generation model{colors.ENDC}")
 
-    # Without any async processing, this function becomes extremely simple.
-    # TODO: add keyboard interrupt to stop listening when desired.
+        self._should_stop_recording = False
+
+    # NOTE: this is very hacky and should be swapped out when we get a chance
+    # at the very least use a coroutine man!
+    def _keyboard_listener(self):
+        time.sleep(0.5)
+        input()
+        debug_print(f"{colors.WARNING}Recording stopped by keyboard interrupt{colors.ENDC}")
+        self._should_stop_recording = True
+    
     def record_audio(self):
         print(f"{colors.OKBLUE}Starting recording...{colors.ENDC}")
-        input_stream = sd.InputStream(callback=None, latency='low', dtype=self.NUMPY_DTYPE)
+        input(f"{colors.HEADER}Press ENTER to start recording.{colors.ENDC}")
+        time.sleep(0.2)
+        print(f"{colors.HEADER}Press enter to stop recording. Recording will automatically end at 30 seconds.{colors.ENDC}")
+        input_stream = sd.InputStream(callback=None, channels=self.NUM_INPUT_CHANNELS, latency='low', dtype=self.NUMPY_DTYPE)
+        
+        buffer = np.empty((0, self.NUM_INPUT_CHANNELS))
+        self._should_stop_recording = False
+        threading.Thread(target=self._keyboard_listener).start()
         input_stream.start()
-        buffer, overflowed = input_stream.read(self.FRAMES_PER_CHUNK)     
+        while not self._should_stop_recording:
+            chunk, overflowed = input_stream.read(self.FRAMES_PER_CHUNK)
+            buffer = np.append(buffer, chunk, axis=0) 
+            if np.size(buffer, 0) > self._FRAMES_PER_SECOND * 30:
+                self._should_stop_recording = True
         input_stream.stop()
         # print(buffer)
         print(f"{colors.OKBLUE}Finished recording{colors.ENDC}")
@@ -162,7 +183,6 @@ class Teffie:
 
     def run(self):
         while True:
-            input(f"{colors.HEADER}Press ENTER to start recording.{colors.ENDC}")
             recorded_audio = self.record_audio()
             transcription = self.transcribe_audio(recorded_audio)
             response = self.generate_response(transcription)
