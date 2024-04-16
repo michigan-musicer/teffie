@@ -76,6 +76,9 @@ class Teffie:
 
     # NOTE: this is very hacky and should be swapped out when we get a chance
     # at the very least use a coroutine man!
+    # NOTE: is confusing if we go 30 seconds because then we need to hit enter to stop this thread
+    # before hitting enter again to start recording.
+    # We just need to rearchitect this listener.
     def _keyboard_listener(self):
         time.sleep(0.5)
         input()
@@ -83,10 +86,10 @@ class Teffie:
         self._should_stop_recording = True
     
     def record_audio(self):
-        print(f"{colors.OKBLUE}Starting recording...{colors.ENDC}")
         input(f"{colors.HEADER}Press ENTER to start recording.{colors.ENDC}")
+        print(f"{colors.OKBLUE}Starting recording...{colors.ENDC}")
         time.sleep(0.2)
-        print(f"{colors.HEADER}Press enter to stop recording. Recording will automatically end at 30 seconds.{colors.ENDC}")
+        print(f"{colors.HEADER}Press ENTER to stop recording. Recording will automatically end at 30 seconds.{colors.ENDC}")
         input_stream = sd.InputStream(callback=None, channels=self.NUM_INPUT_CHANNELS, latency='low', dtype=self.NUMPY_DTYPE)
         
         buffer = np.empty((0, self.NUM_INPUT_CHANNELS))
