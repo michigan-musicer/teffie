@@ -1,0 +1,18 @@
+debug:
+  is_enabled: true
+  should_write_to_file: true
+  filename: "log.txt"
+audio:
+  sample_rate: 16000 # this may be forcibly determined by audio models
+  frames_per_second: 16000
+  seconds_per_chunk: 0.1 # "chunk" refers to slice of input from sounddevice input stream.
+  num_input_channels: 1
+  num_output_channels: 1
+  numpy_dtype: "float32" # used in input stream
+audio_transcription:
+  model: "whisper" # this won't be used so long as we hardcode models
+text_generation:
+  model: "phi-1.5" # this won't be used so long as we hardcode models
+speech_generation:
+  model: "mms" # this won't be used so long as we hardcode models
+  # though we should really change this to bark lol
